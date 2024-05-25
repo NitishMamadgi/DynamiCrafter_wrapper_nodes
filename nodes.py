@@ -1,21 +1,19 @@
-import os
-from omegaconf import OmegaConf
-import torch
-import torch.nn.functional as F
-from .scripts.evaluation.funcs import load_model_checkpoint, get_latent_z
-from .utils.utils import instantiate_from_config
-from einops import repeat
-import folder_paths
-import comfy.model_management as mm
-import comfy.utils
-from contextlib import nullcontext
-from .lvdm.models.samplers.ddim import DDIMSampler
+
+import omegaconf as OmegaConf  # YAML/JSON configuration library
+import torch  # PyTorch library
+import torch.nn.functional as F  # Activation functions
+from .scripts.evaluation.funcs import load_model_checkpoint, get_latent_z  # Load model checkpoint and get latent z
+from .utils.utils import instantiate_from_config  # Instantiate from config
+import einops  # Tensor operations
+import folder_paths  # Folder paths
+import comfy.model_management as mm  # Model management
+import comfy.utils  # Utils
+from contextlib import nullcontext  # Context manager
+from .lvdm.models.samplers.ddim import DDIMSampler  # DDIM sampler
 
 def split_and_trim(input_string):
-    # Split the string into an array using '|' as a separator
     array = input_string.split('|')
-    
-    # Trim white space from each element in the array
+
     trimmed_array = [element.strip() for element in array]
     
     return trimmed_array
@@ -56,16 +54,27 @@ class DynamiCrafterModelLoader:
     CATEGORY = "DynamiCrafterWrapper"
 
     def loadmodel(self, dtype, ckpt_name, fp8_unet=False):
+        # Empty the soft cache
         mm.soft_empty_cache()
+
+        # Set the custom configuration
         custom_config = {
             'dtype': dtype,
             'ckpt_name': ckpt_name,
         }
+
+        # Load the model if it is not already loaded or if the configuration has changed
         if not hasattr(self, 'model') or self.model == None or custom_config != self.current_config:
             self.current_config = custom_config
+
+            # Get the path of the checkpoint file
             model_path = folder_paths.get_full_path("checkpoints", ckpt_name)
+
+            # Get the base name of the checkpoint file
             ckpt_base_name = os.path.basename(ckpt_name)
             base_name, _ = os.path.splitext(ckpt_base_name)
+
+            # Load the configuration file based on the base name
             if 'interp' in base_name and '512' in base_name:
                 config_file=os.path.join(script_directory, "configs", "dynamicrafter_512_interp_v1.yaml")
             elif '1024' in base_name:
@@ -76,12 +85,20 @@ class DynamiCrafterModelLoader:
                 config_file=os.path.join(script_directory, "configs", "dynamicrafter_256_v1.yaml")
             else:
                 print(f"No matching config for model: {ckpt_name}")
-            config = OmegaConf.load(config_file)
+            config = OmegaConf.load(config_file)  # something like a dict ==> omegaconf.dictconfig.DictConfig
+
+            # Load the model configuration
             model_config = config.pop("model", OmegaConf.create())
             model_config['params']['unet_config']['params']['use_checkpoint']=False   
             self.model = instantiate_from_config(model_config)
+
+            # Load the model checkpoint  --> A class object
             self.model = load_model_checkpoint(self.model, model_path)
+
+            # Set the model to evaluation mode
             self.model.eval()
+
+            # Set the data type of the model
             if dtype == "auto":
                 try:
                     if mm.should_use_fp16():
@@ -94,10 +111,18 @@ class DynamiCrafterModelLoader:
                     raise AttributeError("ComfyUI version too old, can't autodetect properly. Set your dtype manually.")
             else:
                 self.model.to(convert_dtype(dtype))
+
+            # Set the data type of the U-Net to fp8 if fp8_unet is True
             if fp8_unet:
                 self.model.model.diffusion_model = self.model.model.diffusion_model.to(torch.float8_e4m3fn)
+
+            # Print the data type of the model
             print(f"Model using dtype: {self.model.dtype}")
+
+            # Print the model
             print(self.model)
+
+        # Return the loaded model
         return (self.model,)
     
 class DynamiCrafterI2V:
@@ -206,6 +231,7 @@ class DynamiCrafterI2V:
             del cond_images, img_emb, text_emb
 
             fs = torch.tensor([fs], dtype=torch.long, device=self.model.device)
+            
             cond = {"c_crossattn": [imtext_cond], "c_concat": [img_tensor_repeat]}
 
             if noise_shape[-1] == 32:
@@ -299,6 +325,7 @@ class DynamiCrafterI2V:
             last_image = video[-1].unsqueeze(0)
             return (video, last_image)
         
+"""""
 class DynamiCrafterBatchInterpolation:
     @classmethod
     def INPUT_TYPES(s):
@@ -502,7 +529,8 @@ class DynamiCrafterBatchInterpolation:
 
             last_image = out_video[-1].unsqueeze(0)
             return (out_video, last_image)
-
+"""
+            
 NODE_CLASS_MAPPINGS = {
     "DynamiCrafterI2V": DynamiCrafterI2V,
     "DynamiCrafterModelLoader": DynamiCrafterModelLoader,
