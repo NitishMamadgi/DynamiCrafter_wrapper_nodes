@@ -1,15 +1,17 @@
 
-import omegaconf as OmegaConf  # YAML/JSON configuration library
+import os
+from omegaconf import OmegaConf  # YAML/JSON configuration library
 import torch  # PyTorch library
 import torch.nn.functional as F  # Activation functions
 from .scripts.evaluation.funcs import load_model_checkpoint, get_latent_z  # Load model checkpoint and get latent z
 from .utils.utils import instantiate_from_config  # Instantiate from config
-import einops  # Tensor operations
+from einops import repeat  # Tensor operations
 import folder_paths  # Folder paths
 import comfy.model_management as mm  # Model management
 import comfy.utils  # Utils
 from contextlib import nullcontext  # Context manager
 from .lvdm.models.samplers.ddim import DDIMSampler  # DDIM sampler
+
 
 def split_and_trim(input_string):
     array = input_string.split('|')
@@ -19,7 +21,7 @@ def split_and_trim(input_string):
     return trimmed_array
 
 def convert_dtype(dtype_str):
-    if dtype_str == 'fp32':
+    if dtype_str == 'fp32': 
         return torch.float32
     elif dtype_str == 'fp16':
         return torch.float16
@@ -51,7 +53,7 @@ class DynamiCrafterModelLoader:
     RETURN_TYPES = ("DCMODEL",)
     RETURN_NAMES = ("DynCraft_model",)
     FUNCTION = "loadmodel"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def loadmodel(self, dtype, ckpt_name, fp8_unet=False):
         # Empty the soft cache
@@ -155,9 +157,9 @@ class Dynamic_dtype:
         }
     
     RETURN_TYPES = ("DCMODEL",)
-    RETURN_NAMES = ("DynCraft_model",)
+    RETURN_NAMES = ("dmodel",)
     FUNCTION = "convert_dtype"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def convert_dtype(self, model, vae_dtype, seed):
 
@@ -185,7 +187,7 @@ class Dynamic_dtype:
 # ..............................................................................................................................
 #...............................................................................................................................
 
-class Dynamic_Apply:
+class Dynamic_encode:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
@@ -198,10 +200,10 @@ class Dynamic_Apply:
             }
         }
     
-    RETURN_TYPES = ("LATENT", "INT", "INT",)
-    RETURN_NAMES = ("latents","orig_H", "orig_W",)
+    RETURN_TYPES = ("LATENT", "LIST")
+    RETURN_NAMES = ("latents","noise_shape")
     FUNCTION = "vae_encode"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def vae_encode(self, model, image, frames, image2=None):
         self.model = model
@@ -220,6 +222,9 @@ class Dynamic_Apply:
                 H = H - (H % 64)
             if orig_H % 64 != 0 or orig_W % 64 != 0:
                 image = F.interpolate(image, size=(H, W), mode="bicubic")
+
+            B, C, H, W = image.shape
+            noise_shape = [B, self.model.model.diffusion_model.out_channels, frames, H // 8, W // 8]
     
             self.model.first_stage_model.to(device)
 
@@ -229,7 +234,7 @@ class Dynamic_Apply:
                 image2 = image2 * 2 - 1
                 image2 = image2.permute(0, 3, 1, 2).to(dtype).to(device)
                 if image2.shape != image.shape:
-                    image2 = F.interpolate(image, size=(H, W), mode="bicubic")
+                    image2 = F.interpolate(image2, size=(H, W), mode="bicubic")
                 z2 = get_latent_z(self.model, image2.unsqueeze(2)) #bc,1,hw
                 img_tensor_repeat = repeat(z, 'b c t h w -> b c (repeat t) h w', repeat=frames)
                 img_tensor_repeat = torch.zeros_like(img_tensor_repeat)
@@ -240,7 +245,7 @@ class Dynamic_Apply:
 
             self.model.first_stage_model.to('cpu')
 
-            return (img_tensor_repeat, orig_H, orig_W,)
+            return (img_tensor_repeat, noise_shape)
     
 
 # ..............................................................................................................................
@@ -258,13 +263,25 @@ class Dynamic_Image_Conditioning:
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("img_emb",)
     FUNCTION = "image_conditioning"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def image_conditioning(self, model, image):
         self.model = model
         dtype, autocast = device_setup(self.model)
 
         with torch.autocast(comfy.model_management.get_autocast_device(device), dtype=dtype) if autocast else nullcontext():
+            image = image * 2 - 1
+            image = image.permute(0, 3, 1, 2).to(dtype).to(device)
+
+            B, C, H, W = image.shape
+            orig_H, orig_W = H, W
+            if W % 64 != 0:
+                W = W - (W % 64)
+            if H % 64 != 0:
+                H = H - (H % 64)
+            if orig_H % 64 != 0 or orig_W % 64 != 0:
+                image = F.interpolate(image, size=(H, W), mode="bicubic")
+    
             self.model.cond_stage_model.to(device)
             self.model.embedder.to(device)
             self.model.image_proj_model.to(device)
@@ -277,20 +294,19 @@ class Dynamic_Image_Conditioning:
 
 # ..............................................................................................................................
 #...............................................................................................................................
-
 class Dynamic_Text_Conditioning:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
             "model": ("DCMODEL",),
-            "prompt": ("TEXT",),
+            "prompt": ("STRING", {"multiline": True, "default": "",}),
             }
         }
     
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("text_emb",)
     FUNCTION = "text_conditioning"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def text_conditioning(self, model, prompt):
         self.model = model
@@ -317,12 +333,13 @@ class Text_Image_Conditioning_Combine:
     RETURN_TYPES = ("CONDITIONING",)
     RETURN_NAMES = ("imtext_emb",)
     FUNCTION = "conditioning_combine"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
     def conditioning_combine(self, img_emb, text_emb):
-        imtext_emb = torch.cat((img_emb, text_emb), dim=1)
+        imtext_emb = torch.cat((text_emb, img_emb), dim=1)
         del img_emb, text_emb
         return (imtext_emb,)
+
 
 # ..............................................................................................................................
 #...............................................................................................................................
@@ -333,10 +350,12 @@ class Dynamic_Sampler:
         return {"required": {
             "model": ("DCMODEL",),
             "imtext_cond": ("CONDITIONING",),
-            "imge_tensor_repeat": ("LATENT",),
+            "img_tensor_repeat": ("LATENT",),
+            "noise_shape": ("LIST",),
             "steps": ("INT", {"default": 50, "min": 1, "max": 200, "step": 1}),
             "cfg": ("FLOAT", {"default": 7.0, "min": 0.0, "max": 20.0, "step": 0.01}),
             "eta": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+            "fs": ("INT", {"default": 10, "min": 2, "max": 100, "step": 1}),
             },
             "optional": {
                 "mask": ("MASK",),
@@ -348,34 +367,33 @@ class Dynamic_Sampler:
     RETURN_TYPES = ("LATENT",)
     RETURN_NAMES = ("samples",)
     FUNCTION = "process"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
 
-    def process(self,model, imtext_cond,img_tensor_repeat,cfg, steps, eta, frame_window_size=16, frame_window_stride=4, mask=None ):
+    def process(self,model, imtext_cond,img_tensor_repeat, noise_shape, cfg, steps, eta, fs, frame_window_size=16, frame_window_stride=4, mask=None ):
         self.model = model
         dtype, autocast = device_setup(self.model)
 
         with torch.autocast(comfy.model_management.get_autocast_device(device), dtype=dtype) if autocast else nullcontext():
 
-            B,C,T,H,W = img_tensor_repeat.shape
-            noise_shape = [B, C, T, H, W]
-
             cond = {"c_crossattn": [imtext_cond], "c_concat": [img_tensor_repeat]}
 
             if cfg != 1.0:
-                if imtext_cond.shape[1] == x :
-                    uc_emb = self.model.get_learned_conditioning([""])
+                if imtext_cond.shape[1] == 333:
+                    uc_txt = self.model.get_learned_conditioning([""])
                     ## process image embedding token
                     if hasattr(self.model, 'embedder'):
                         uc_img = torch.zeros(noise_shape[0],3,224,224).to(self.model.device)
                         ## img: b c h w >> b l c
                         uc_img = self.model.embedder(uc_img)
                         uc_img = self.model.image_proj_model(uc_img)
-                        uc_emb = torch.cat([uc_emb, uc_img], dim=1)
+                        uc_emb = torch.cat([uc_txt, uc_img], dim=1)
+                    else:
+                        uc_emb = uc_txt
                     if isinstance(cond, dict):
                         uc = {key:cond[key] for key in cond.keys()}
                         uc.update({'c_crossattn': [uc_emb]})
 
-                elif imtext_cond.shape[1] == x2 :
+                elif imtext_cond.shape[1] == 77:
                     uc_emb = self.model.get_learned_conditioning([""])
                     if isinstance(cond, dict):
                         uc = {key:cond[key] for key in cond.keys()}
@@ -387,7 +405,7 @@ class Dynamic_Sampler:
                         ## img: b c h w >> b l c
                         uc_img = self.model.embedder(uc_img)
                         uc_img = self.model.image_proj_model(uc_img)
-                        uc_emb = torch.cat([uc_emb, uc_img], dim=1)
+                        uc_emb = uc_img
                     if isinstance(cond, dict):
                         uc = {key:cond[key] for key in cond.keys()}
                         uc.update({'c_crossattn': [uc_emb]})
@@ -445,28 +463,28 @@ class Dynamic_Sampler:
                                             )
             
             assert not torch.isnan(samples).any().item(), "Resulting tensor containts NaNs. I'm unsure why this happens, changing step count and/or image dimensions might help."
+            
             return (samples,)
 
 # ..............................................................................................................................
 #...............................................................................................................................
 
-class Dynamic_decode:
+class sample_decode:
     @classmethod
     def INPUT_TYPES(s):
         return {"required": {
-            "samples": ("SAMPLES",),
-            "keep_model_loaded": ("BOOLEAN", {"default": True}),
-            "orig_H" : ("INT",),
-            "orig_W" : ("INT",),
+            "model": ("DCMODEL",),
+            "samples": ("LATENT",),
+            "keep_model_loaded" : ("BOOLEAN", {"default": False}),
             }
         }
     
-    RETURN_TYPES = ("IMAGE","IMAGE",)
-    RETURN_NAMES = ("images", "last_image",)
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("images",)
     FUNCTION = "vae_decode"
-    CATEGORY = "DynamiCrafterWrapper"
+    CATEGORY = "DynamiCrafterWrapper_qsn"
         
-    def vae_decode(self, model, samples, keep_model_loaded, orig_H, orig_W):
+    def vae_decode(self, model, samples, keep_model_loaded):
         self.model = model
         dtype, autocast = device_setup(self.model)
 
@@ -475,47 +493,41 @@ class Dynamic_decode:
             self.model.first_stage_model.to(device)
             decoded_images = self.model.decode_first_stage(samples) #b c t h w
             self.model.first_stage_model.to('cpu')
-            
+            del samples
+
             video = decoded_images.detach().cpu()
             video = torch.clamp(video.float(), -1., 1.)
             video = (video + 1.0) / 2.0
             video = video.squeeze(0).permute(1, 2, 3, 0)
-            del decoded_images, samples
-
+            del decoded_images
+            
             if not keep_model_loaded:
                 self.model.to('cpu')
                 mm.soft_empty_cache()
 
-            # Ensure the final dimensions are divisible by 2
-            final_H = (orig_H // 2) * 2
-            final_W = (orig_W // 2) * 2
-
-            if video.shape[1] != final_H or video.shape[2] != final_W:
-                video = F.interpolate(video.permute(0, 3, 1, 2), size=(final_H, final_W), mode="bicubic").permute(0, 2, 3, 1)
-            last_image = video[-1].unsqueeze(0)
-            return (video, last_image)
+            return (video,)
 
             
 NODE_CLASS_MAPPINGS = {
-    "DynamiCrafterModelLoader": "DynamiCrafterModelLoader",
-    "Dynamic_dtype" : "Dynamic_dtype",
-    "Dynamic_Apply": "Dynamic_Apply",
-    "Dynamic_Image_Conditioning": "Dynamic_Image_Conditioning",
-    "Dynamic_Text_Conditioning": "Dynamic_Text_Conditioning",
-    "Text_Image_Conditioning_Combine": "Text_Image_Conditioning_Combine",
-    "Dynamic_Sampler": "Dynamic_Sampler",
-    "Dynamic_decode": "Dynamic_decode",
-}
+    "DynamiCrafterModelLoader": DynamiCrafterModelLoader,
+    "Dynamic_dtype": Dynamic_dtype,
+    "Dynamic_encode": Dynamic_encode,
+    "Dynamic_Image_Conditioning": Dynamic_Image_Conditioning,
+    "Dynamic_Text_Conditioning": Dynamic_Text_Conditioning,
+    "Text_Image_Conditioning_Combine": Text_Image_Conditioning_Combine,
+    "Dynamic_Sampler": Dynamic_Sampler,
+    "sample_decode": sample_decode
+    }
 
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "DynamiCrafterModelLoader": "qs_Dynamic_loader",
-    "Dynamic_dtype" : "qs_Dynamic_dtype",
-    "Dynamic_Apply": "qs_Dynamic_apply",
-    "Dynamic_Image_Conditioning": "qs_Dynamic_image_conditioning",
-    "Dynamic_Text_Conditioning": "qs_Dynamic_text_conditioning",
-    "Text_Image_Conditioning_Combine": "qs_Text_image_conditioning_combine",
-    "Dynamic_Sampler": "qs_Dynamic_sampler",
-    "Dynamic_decode": "qs_Dynamic_decode",
-}
+    "DynamiCrafterModelLoader": "DynamiCrafterModelLoader_qsn",
+    "Dynamic_dtype": "Dynamic_dtype_qsn",
+    "Dynamic_encode": "Dynamic_encode_qsn",
+    "Dynamic_Image_Conditioning": "Dynamic_Image_Conditioning_qsn",
+    "Dynamic_Text_Conditioning": "Dynamic_Text_Conditioning_qsn",
+    "Text_Image_Conditioning_Combine": "Text_Image_Conditioning_Combine_qsn",
+    "Dynamic_Sampler": "Dynamic_Sampler_qsn",
+    "sample_decode": "sample_decode_qsn"
+    }
 
